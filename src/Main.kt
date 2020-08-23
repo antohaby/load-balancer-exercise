@@ -1,5 +1,7 @@
 package com.github.antohaby.loadbalancer
 
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import mu.KotlinLogging
 import kotlin.random.Random
@@ -10,7 +12,7 @@ val logger = KotlinLogging.logger { }
 fun main(): Unit = runBlocking {
     val max = 10
     val providerRegistry = SimpleLimitedProviderList(max)
-    repeat(max) {
+    repeat(3) {
         val err = providerRegistry.register(
             "ID-$it", SimpleProvider(
                 id = "ID-$it",
@@ -21,34 +23,48 @@ fun main(): Unit = runBlocking {
         if (err != null) throw err
     }
 
-    // Try add more
-    val err = providerRegistry.register(
-        "ID-999", SimpleProvider(
-            id = "ID-999",
-            slownessRange = 100L..200L,
-            random = random
-        )
+    val balancer = Balancer(
+        registry = providerRegistry,
+        iterationStrategy = RoundRobin
     )
-    if (err != null) {
-        logger.error(err) { "Cant add more" }
+
+    // Launch 3 concurrent workers
+    repeat(3) { workerNo ->
+
+        // Each of them would call 10k times balancer's get method
+        launch {
+            repeat(100) {
+                try {
+                    val res = balancer.get()
+                    logger.info { "Worker[$workerNo]: $res" }
+                } catch (e: Balancer.Error) {
+                    logger.error(e) { "Worker[$workerNo]: ${e.message}" }
+                }
+            }
+        }
     }
 
+    // Slowly add/remove providers
+    launch {
+        repeat(7) { providerNo ->
+            delay(1_000) // 1 s
+            logger.info { "Add New: $providerNo" }
+            providerRegistry.register(
+                "NEW-$providerNo", SimpleProvider(
+                    id = "NEW-$providerNo",
+                    slownessRange = 100L..1000L,
+                    random = random
+                )
+            )
+        }
 
-    //Unregister one
-    val success = providerRegistry.unregister("ID-5")
-    if (!success) {
-        logger.error { "Cant remove ID-5" }
+        // Now slowly remove
+        repeat(7) {
+            delay(500) // 0.5 s
+            logger.info { "Remove New: $it" }
+            providerRegistry.unregister("NEW-$it")
+        }
     }
 
-    //Try again
-    val err2 = providerRegistry.register(
-        "ID-999", SimpleProvider(
-            id = "ID-999",
-            slownessRange = 100L..200L,
-            random = random
-        )
-    )
-    if (err2 != null) {
-        logger.error(err) { "Cant add more" }
-    }
+    balancer.stop()
 }
