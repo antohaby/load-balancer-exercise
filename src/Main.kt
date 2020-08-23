@@ -26,7 +26,8 @@ fun main(): Unit = runBlocking {
     }
 
     val heartbeatController = SimpleHeartbeat(
-        interval = 1000L
+        interval = 300L,
+        deadDetectStrategy = { makeAliveAfterXRounds(2) }
     )
 
     val balancer = Balancer(
@@ -46,33 +47,10 @@ fun main(): Unit = runBlocking {
                         val res = balancer.get()
                         logger.info { "Worker[$workerNo]: $res" }
                     } catch (e: Balancer.Error) {
-                        logger.error(e) { "Worker[$workerNo]: ${e.message}" }
-                        delay(100L)
+                        logger.warn { "Worker[$workerNo]: ${e.message}" }
+                        delay(1000L)
                     }
                 }
-            }
-        }
-
-        // Slowly add/remove providers
-        launch {
-            repeat(7) { providerNo ->
-                delay(1_000) // 1 s
-                logger.info { "Add New: $providerNo" }
-                providerRegistry.register(
-                    "NEW-$providerNo", SimpleProvider(
-                        id = "NEW-$providerNo",
-                        slownessRange = 100L..1000L,
-                        failureChance = 0.2f,
-                        random = random
-                    )
-                )
-            }
-
-            // Now slowly remove
-            repeat(7) {
-                delay(500) // 0.5 s
-                logger.info { "Remove New: $it" }
-                providerRegistry.unregister("NEW-$it")
             }
         }
     }
