@@ -17,8 +17,8 @@ fun main(): Unit = runBlocking {
         val err = providerRegistry.register(
             "ID-$it", SimpleProvider(
                 id = "ID-$it",
-                slownessRange = 100L..200L,
-                failureChance = 0.1f,
+                slownessRange = 100L..2000L,
+                failureChance = 0.5f,
                 random = random
             )
         )
@@ -33,8 +33,11 @@ fun main(): Unit = runBlocking {
     val balancer = Balancer(
         registry = providerRegistry,
         iterationStrategy = RoundRobin,
-        heartbeatController = heartbeatController
+        heartbeatController = heartbeatController,
+        callLimiter = { maxCallLimit(2) }
     )
+
+    balancer.start()
 
     coroutineScope {
         // Launch 3 concurrent workers
@@ -43,12 +46,13 @@ fun main(): Unit = runBlocking {
             // Each of them would call 10k times balancer's get method
             launch {
                 repeat(100) {
-                    try {
-                        val res = balancer.get()
-                        logger.info { "Worker[$workerNo]: $res" }
-                    } catch (e: Balancer.Error) {
-                        logger.warn { "Worker[$workerNo]: ${e.message}" }
-                        delay(1000L)
+                    val res = balancer.getAsync().await()
+                    when (res) {
+                        is Balancer.Response.Success -> logger.info { "Worker[$workerNo]: ${res.data}" }
+                        is Balancer.Response.Fail -> {
+                            logger.warn { "Worker[$workerNo]: ${res.error.message}" }
+                            delay(1000L)
+                        }
                     }
                 }
             }

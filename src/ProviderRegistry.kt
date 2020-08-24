@@ -7,13 +7,15 @@ interface ProviderRegistry {
     open class RegistrationError(msg: String) : Exception(msg)
 
     sealed class Event {
+        abstract val id: String
+
         data class Added(
-            val id: String,
+            override val id: String,
             val provider: Provider
         ) : Event()
 
         data class Removed(
-            val id: String,
+            override val id: String,
             val provider: Provider
         ) : Event()
     }

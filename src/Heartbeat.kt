@@ -2,11 +2,25 @@ package com.github.antohaby.loadbalancer
 
 import kotlinx.coroutines.*
 
+/**
+ * Heartbeat controller
+ */
 interface HeartbeatController {
     enum class Status { Alive, Dead }
+
+    /**
+     * Client can request to watch some resource by delegating [check] method
+     * and it will be informed about status changes via [onStatusChange]
+     *
+     * It returns watching job that can be cancelled
+     */
     fun CoroutineScope.watch(check: suspend () -> Boolean, onStatusChange: suspend (Status) -> Unit): Job
 }
 
+/**
+ * Simple heartbeat implementation that just simply checks every [interval] ms
+ * and delegates sequence of statuses true/false to [deadDetectStrategy] to decide about liveness status
+ */
 class SimpleHeartbeat(
     val interval: Long,
     val deadDetectStrategy: () -> (Boolean) -> HeartbeatController.Status

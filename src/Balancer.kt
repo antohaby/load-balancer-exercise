@@ -5,10 +5,20 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import mu.KotlinLogging
 
+/**
+ * Load Balancer of some list of [Provider] which is controlled by [registry]
+ * @param iterationStrategy decides how to iterate over list of Providers (eg. round robin, random, etc...)
+ * @param heartbeatController sets Heartbeat Controller that excludes/includes certain [Provider] based on its status
+ * @param callLimiter provides [CallLimiter] that controls amount of incoming calls
+ *
+ * It is mandatory to explicitly [start] Balancer, and [stop] at the end
+ *
+ */
 class Balancer(
-    registry: ProviderRegistry,
-    private val iterationStrategy: IterationStrategy,
-    private val heartbeatController: HeartbeatController
+    val registry: ProviderRegistry,
+    iterationStrategy: IterationStrategy,
+    private val heartbeatController: HeartbeatController,
+    private val callLimiter: () -> CallLimiter<String>
 ) {
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
 
@@ -16,104 +26,124 @@ class Balancer(
 
     sealed class Error(msg: String) : Exception(msg) {
         class NoProvidersAvailable(msg: String): Error(msg)
+        class CapacityLimit(msg: String): Error(msg)
+        class ProviderFailure(msg: String): Error(msg)
     }
 
-    private data class ProviderWrap(
-        val provider: Provider,
-        val isAlive: Boolean
-    )
+    sealed class Response {
+        data class Success(val data: String): Response()
+        data class Fail(val error: Error): Response()
+    }
 
-    private val registrySubscription: ProviderRegistry.Subscription
-    private val providers: MutableMap<String,ProviderWrap>
-    private var iterator: Iterator<ProviderWrap>
-    private val providersMutex = Mutex()
+    private var registrySubscription: ProviderRegistry.Subscription? = null
+    private val iterator: LoopIterator<Provider> = iterationStrategy.iterator(listOf())
 
-    private val heartbeatJobs = mutableMapOf<String, Job>()
+    private val heartbeats: MutableMap<String, Job> = mutableMapOf()
+    private val limiters: MutableMap<Provider, CallLimiter<String>> = mutableMapOf()
 
-    init {
-        registrySubscription = registry.subscribe { event ->
-            providersMutex.withLock {
-                onRegistryEvent(event)
-                restartIterator()
-            }
+    private val iteratorMutex = Mutex()
+
+    /**
+     * Starts Balancer
+     *
+     * TODO: Protect from double call
+     */
+    suspend fun start() {
+        val subscription = registry.subscribe(this::onRegistryEvent)
+        for ((id, provider) in subscription.initial) {
+            addToBalancer(id, provider)
         }
-
-        providers = registrySubscription.initial
-            .mapValues { providerWrap(it.key, it.value) }
-            .toMutableMap()
-
-        iterator = iterationStrategy.iterator(providers.values.toList())
-
-        for ( (id, providerWrap) in providers) {
-            heartbeatJobs[id] = watchProvider(id, providerWrap.provider)
-        }
+        registrySubscription = subscription
     }
 
-    private suspend fun onRegistryEvent(event: ProviderRegistry.Event) {
-        when (event) {
-            is ProviderRegistry.Event.Added -> {
-                providers[event.id] = providerWrap(event.id, event.provider)
-                heartbeatJobs[event.id] = watchProvider(event.id, event.provider)
-            }
-            is ProviderRegistry.Event.Removed -> {
-                providers.remove(event.id)
-                heartbeatJobs[event.id]?.cancelAndJoin()
-            }
-        }
+    /**
+     * Stops Balancer
+     *
+     * TODO: Protect from double call
+     */
+    suspend fun stop() {
+        scope.cancel()
+        registrySubscription?.cancel?.invoke()
     }
 
-    private fun providerWrap(id: String, provider: Provider): ProviderWrap {
-        return ProviderWrap(
-            provider = provider,
-            isAlive = true
-        )
-    }
-
-    private fun watchProvider(id: String, provider: Provider): Job {
-        return with(heartbeatController) {
-            scope.watch(provider::check) { status ->
-                onHeartbeatChange(id, status)
-            }
-        }
-    }
-
-    private fun restartIterator() {
-        val healthyProviders = providers
-            .values
-            .filter { it.isAlive }
-
-        logger.info { "Healthy Providers: ${providers.filter { it.value.isAlive }.keys}" }
-        iterator = iterationStrategy.iterator(healthyProviders)
-    }
-
-    private suspend fun onHeartbeatChange(id: String, status: HeartbeatController.Status) {
-        logger.info { "Provider #$id is $status" }
-        val isAlive = when(status) {
-            HeartbeatController.Status.Alive -> true
-            HeartbeatController.Status.Dead -> false
-        }
-
-        providersMutex.withLock {
-            val old = providers[id] ?: error("Provider not found")
-            providers[id] = old.copy(isAlive = isAlive)
-            restartIterator()
-        }
-    }
-
-    suspend fun get(): String {
-        val entry = providersMutex.withLock {
+    /**
+     * The entrypoint
+     */
+    suspend fun getAsync(): Deferred<Response> {
+        val deferred = CompletableDeferred<Response>()
+        val provider = iteratorMutex.withLock {
             if (!iterator.hasNext()) {
-                throw Error.NoProvidersAvailable("No active providers available to handle request")
+                return@withLock null
             }
 
             iterator.next()
+        } ?: return deferred
+            .also { it.complete(Response.Fail(Error.NoProvidersAvailable("No providers available"))) }
+
+        val limiter = limiters[provider] ?: error("Critical error, limiter must be available")
+        val limiterResponse = with(limiter) {
+            scope.withLimit {
+                provider.get()
+            }
         }
 
-        return entry.provider.get()
+        when (limiterResponse) {
+            is CallLimiterResponse.Admit -> scope.launch {
+                try {
+                    val result = limiterResponse.result.await()
+                    deferred.complete(Response.Success(result))
+                } catch (e: Exception) {
+                    deferred.complete(Response.Fail(Error.ProviderFailure(e.toString())))
+                }
+            }
+            is CallLimiterResponse.Reject -> {
+                scope.launch { onOverCapacity(provider, limiterResponse.unblocked) }
+                deferred.complete(Response.Fail(Error.CapacityLimit("Out Of Limit")))
+            }
+        }
+
+        return deferred
     }
 
-    suspend fun stop() {
-        scope.cancel()
-        registrySubscription.cancel()
+    private suspend fun onOverCapacity(provider: Provider, unblocked: Deferred<Unit>) = iteratorMutex.withLock {
+        logger.info { "Over Capacity for ${provider.hashCode()}, excluding" }
+        iterator.exclude(provider)
+        try {
+            unblocked.await()
+        } finally {
+            iterator.include(provider)
+        }
+        logger.info { "Over Capacity is over ${provider.hashCode()}, including" }
+    }
+
+    private suspend fun onRegistryEvent(event: ProviderRegistry.Event) {
+        logger.info { "Provider: ${event.id} is ${event.javaClass}" }
+        when (event) {
+            is ProviderRegistry.Event.Added -> addToBalancer(event.id, event.provider)
+            is ProviderRegistry.Event.Removed -> removeFromBalancer(event.id, event.provider)
+        }
+    }
+
+    private suspend fun addToBalancer(id: String, provider: Provider) =  iteratorMutex.withLock {
+        iterator.include(provider)
+        heartbeats[id] = heartbeatWatch(provider)
+        limiters[provider] = callLimiter()
+    }
+
+    private suspend fun removeFromBalancer(id: String, provider: Provider) =  iteratorMutex.withLock {
+        iterator.exclude(provider)
+        heartbeats[id]?.cancelAndJoin()
+        limiters.remove(provider)
+    }
+
+    private fun heartbeatWatch(provider: Provider) = with(heartbeatController) {
+        scope.watch(provider::check) { status ->
+            iteratorMutex.withLock {
+                when (status) {
+                    HeartbeatController.Status.Alive -> iterator.include(provider)
+                    HeartbeatController.Status.Dead ->  iterator.exclude(provider)
+                }
+            }
+        }
     }
 }
